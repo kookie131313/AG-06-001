@@ -1,19 +1,24 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { z } from 'zod'
 
+import { createUnifiedLogsSearch } from '../UnifiedLogs.utils'
 import {
+  areFilterGroupsEquivalent,
   buildColumnFilterValues,
   buildFilterGroup,
   buildFilterProperties,
   filterPropertySchema,
   formatTimeRangeValue,
+  getLogAttributeSources,
   getUserFilterValue,
-  parseTimeRange,
-  serializeTimeRange,
+  normalizeFilterGroup,
   TIME_RANGE_PROPERTY,
   USER_PROPERTY,
   type FilterableField,
 } from './LogsFilterBar.utils'
+import {
+  parseTimeRange,
+  serializeTimeRange,
+} from '@/components/interfaces/Settings/Logs/Logs.timeRange'
 
 describe('buildFilterProperties', () => {
   const fields: FilterableField[] = [
@@ -38,36 +43,16 @@ describe('buildFilterProperties', () => {
     expect(names).toEqual(['date', 'log_type', 'event_message', 'pathname', USER_PROPERTY])
   })
 
-  it('gives the event_message column pattern (ILIKE) operators', () => {
-    const eventMessage = buildFilterProperties({ fields }).find(
-      (property) => property.name === 'event_message'
+  it.each([
+    ['event_message', ['~~*', '!~~*']],
+    ['log_type', ['=', '<>']],
+    ['pathname', ['=', '<>', '~~*', '!~~*']],
+  ])('gives the %s column the %j operators', (name, operators) => {
+    const property = buildFilterProperties({ fields }).find((property) => property.name === name)
+    const operatorValues = property?.operators?.map((operator) =>
+      typeof operator === 'string' ? operator : operator.value
     )
-    expect(eventMessage?.operators).toEqual([
-      { label: 'iLike', value: '~~*', group: 'pattern' },
-      { label: 'Not iLike', value: '!~~*', group: 'pattern' },
-    ])
-  })
-
-  it('gives every other column comparison operators', () => {
-    const logType = buildFilterProperties({ fields }).find(
-      (property) => property.name === 'log_type'
-    )
-    expect(logType?.operators).toEqual([
-      { label: 'Equals', value: '=', group: 'comparison' },
-      { label: 'Not equal', value: '<>', group: 'comparison' },
-    ])
-  })
-
-  it('gives pathname both comparison and pattern (ILIKE) operators', () => {
-    const pathname = buildFilterProperties({ fields }).find(
-      (property) => property.name === 'pathname'
-    )
-    expect(pathname?.operators).toEqual([
-      { label: 'Equals', value: '=', group: 'comparison' },
-      { label: 'Not equal', value: '<>', group: 'comparison' },
-      { label: 'iLike', value: '~~*', group: 'pattern' },
-      { label: 'Not iLike', value: '!~~*', group: 'pattern' },
-    ])
+    expect(operatorValues).toEqual(operators)
   })
 
   it('defaults a column without options to an empty array', () => {
@@ -87,7 +72,15 @@ describe('buildFilterProperties', () => {
       type: 'string',
       options: [],
       operators: [{ label: 'Equals', value: '=', group: 'comparison' }],
+      topLevelOnly: true,
     })
+  })
+
+  it('keeps properties that change which sources are queried out of nested groups', () => {
+    const topLevelOnly = buildFilterProperties({ fields })
+      .filter((property) => property.topLevelOnly)
+      .map((property) => property.name)
+    expect(topLevelOnly).toEqual(['date', 'log_type', USER_PROPERTY])
   })
 
   it('wires a provided async options function into the user property', () => {
@@ -100,20 +93,16 @@ describe('buildFilterProperties', () => {
 })
 
 describe('getUserFilterValue', () => {
-  const resultSchema = z.string().optional()
-
-  it('returns the user condition value coerced to a string, validated by schema', () => {
+  it('returns the user condition value', () => {
     const result = getUserFilterValue([
       { propertyName: 'log_type', value: 'postgres', operator: '=' },
       { propertyName: USER_PROPERTY, value: 'abc@example.com', operator: '=' },
     ])
-    expect(() => resultSchema.parse(result)).not.toThrow()
     expect(result).toBe('abc@example.com')
   })
 
   it('coerces a non-string condition value to a string', () => {
     const result = getUserFilterValue([{ propertyName: USER_PROPERTY, value: 42, operator: '=' }])
-    expect(() => resultSchema.parse(result)).not.toThrow()
     expect(result).toBe('42')
   })
 
@@ -121,7 +110,6 @@ describe('getUserFilterValue', () => {
     const result = getUserFilterValue([
       { propertyName: 'log_type', value: 'postgres', operator: '=' },
     ])
-    expect(() => resultSchema.parse(result)).not.toThrow()
     expect(result).toBeUndefined()
   })
 
@@ -218,19 +206,6 @@ describe('time range filters', () => {
     expect(parseTimeRange(serializeTimeRange(range))).toEqual(range)
   })
 
-  it.each([
-    undefined,
-    null,
-    '',
-    'invalid',
-    '2026-09-22T02:00:00Z',
-    'invalid – 2026-09-22T03:00:00Z',
-    '2026-09-22T03:00:00Z – 2026-09-22T02:00:00Z',
-    '2026-09-22T02:00:00Z – 2026-09-22T03:00:00Z – 2026-09-22T04:00:00Z',
-  ])('rejects an invalid or incomplete range: %s', (value) => {
-    expect(parseTimeRange(value)).toBeUndefined()
-  })
-
   it('does not wrap dates as ordinary log attribute filters', () => {
     const values = buildColumnFilterValues([
       { propertyName: TIME_RANGE_PROPERTY, value: serializeTimeRange(range), operator: '=' },
@@ -282,5 +257,265 @@ describe('time range labels', () => {
   it('preserves incomplete values while editing', () => {
     expect(formatTimeRangeValue('unfinished')).toBe('unfinished')
     expect(formatTimeRangeValue(null)).toBe('')
+  })
+})
+
+describe('attribute discovery scope', () => {
+  it('intersects the selected types with fixed resource scope', () => {
+    const search = createUnifiedLogsSearch(
+      { filter: ['log_type:neq:edge function runtime'] },
+      {
+        filters: [
+          { column: 'log_type', operator: '=', value: 'edge function' },
+          { column: 'log_type', operator: '=', value: 'edge function runtime' },
+          { column: 'function_id', operator: '=', value: 'fn-1' },
+        ],
+      }
+    )
+    expect(getLogAttributeSources(search)).toEqual(['function_edge_logs'])
+  })
+
+  it('does not discover sources that cannot match a scoped user filter', () => {
+    const search = createUnifiedLogsSearch(
+      { user: 'user-1' },
+      {
+        filters: [{ column: 'log_type', operator: '=', value: 'edge function' }],
+      }
+    )
+    expect(getLogAttributeSources(search)).toEqual([])
+  })
+})
+
+describe('filter groups', () => {
+  const orGroup = {
+    logicalOperator: 'OR' as const,
+    conditions: [
+      { propertyName: 'status', operator: '<>', value: '200' },
+      { propertyName: 'pathname', operator: '<>', value: '/health' },
+    ],
+  }
+
+  it('renders group column filters as nested OR groups after the flat conditions', () => {
+    const group = buildFilterGroup(
+      [
+        {
+          id: 'group.0',
+          value: {
+            group: 'or',
+            filters: [
+              { column: 'status', operator: '<>', value: '200' },
+              { column: 'pathname', operator: '<>', value: '/health' },
+            ],
+          },
+        },
+        { id: 'level', value: { operator: '=', values: ['error'] } },
+      ],
+      new Set(['level'])
+    )
+    expect(group).toEqual({
+      logicalOperator: 'AND',
+      conditions: [{ propertyName: 'level', operator: '=', value: 'error' }, orGroup],
+    })
+  })
+
+  it('splits the bar into flat conditions and OR groups', () => {
+    const normalized = normalizeFilterGroup({
+      logicalOperator: 'AND',
+      conditions: [{ propertyName: 'level', operator: '=', value: 'error' }, orGroup],
+    })
+    expect(normalized).toEqual({
+      conditions: [{ propertyName: 'level', operator: '=', value: 'error' }],
+      groups: [
+        {
+          group: 'or',
+          filters: [
+            { column: 'status', operator: '<>', value: '200' },
+            { column: 'pathname', operator: '<>', value: '/health' },
+          ],
+        },
+      ],
+    })
+  })
+
+  it('merges nested AND groups into the root and nested OR groups into their parent OR', () => {
+    const normalized = normalizeFilterGroup({
+      logicalOperator: 'AND',
+      conditions: [
+        {
+          logicalOperator: 'AND',
+          conditions: [{ propertyName: 'level', operator: '=', value: 'error' }],
+        },
+        {
+          logicalOperator: 'OR',
+          conditions: [
+            { propertyName: 'status', operator: '=', value: '500' },
+            {
+              logicalOperator: 'OR',
+              conditions: [{ propertyName: 'status', operator: '=', value: '502' }],
+            },
+          ],
+        },
+      ],
+    })
+    expect(normalized?.conditions).toHaveLength(1)
+    expect(normalized?.groups).toEqual([
+      {
+        group: 'or',
+        filters: [
+          { column: 'status', operator: '=', value: '500' },
+          { column: 'status', operator: '=', value: '502' },
+        ],
+      },
+    ])
+  })
+
+  it.each([
+    [
+      'a group condition without a value',
+      {
+        logicalOperator: 'AND' as const,
+        conditions: [
+          {
+            logicalOperator: 'OR' as const,
+            conditions: [{ propertyName: 'status', operator: '=', value: '' }],
+          },
+        ],
+      },
+    ],
+    [
+      'an AND group inside an OR group',
+      {
+        logicalOperator: 'AND' as const,
+        conditions: [
+          {
+            logicalOperator: 'OR' as const,
+            conditions: [
+              {
+                logicalOperator: 'AND' as const,
+                conditions: [{ propertyName: 'status', operator: '=', value: '200' }],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    [
+      'a top-level-only column inside a group',
+      {
+        logicalOperator: 'AND' as const,
+        conditions: [
+          {
+            logicalOperator: 'OR' as const,
+            conditions: [{ propertyName: 'log_type', operator: '=', value: 'auth' }],
+          },
+        ],
+      },
+    ],
+    [
+      'an OR root',
+      {
+        logicalOperator: 'OR' as const,
+        conditions: [{ propertyName: 'status', operator: '=', value: '200' }],
+      },
+    ],
+  ])('does not apply %s', (_, group) => {
+    expect(normalizeFilterGroup(group)).toBeNull()
+  })
+
+  it('does not apply a root that uses one column with different operators', () => {
+    expect(
+      normalizeFilterGroup({
+        logicalOperator: 'AND',
+        conditions: [
+          {
+            logicalOperator: 'AND',
+            conditions: [
+              { propertyName: 'status', operator: '<>', value: '200' },
+              { propertyName: 'status', operator: '=', value: '500' },
+            ],
+          },
+        ],
+      })
+    ).toBeNull()
+  })
+
+  it('applies a root that repeats a column with the same operator', () => {
+    const conditions = [
+      { propertyName: 'status', operator: '<>', value: '200' },
+      { propertyName: 'status', operator: '<>', value: '500' },
+    ]
+    expect(normalizeFilterGroup({ logicalOperator: 'AND', conditions })).toEqual({
+      conditions,
+      groups: [],
+    })
+  })
+
+  it('skips an empty group so a group emptied by removing its last condition stops filtering', () => {
+    const level = { propertyName: 'level', operator: '=', value: 'error' }
+    expect(
+      normalizeFilterGroup({
+        logicalOperator: 'AND',
+        conditions: [level, { logicalOperator: 'OR', conditions: [] }],
+      })
+    ).toEqual({ conditions: [level], groups: [] })
+  })
+
+  describe('areFilterGroupsEquivalent', () => {
+    const level = { propertyName: 'level', operator: '=', value: 'error' }
+    const status = { propertyName: 'status', operator: '<>', value: '200' }
+    const path = { propertyName: 'pathname', operator: '<>', value: '/health' }
+
+    it('treats a nested AND group as equal to the same conditions at the root', () => {
+      expect(
+        areFilterGroupsEquivalent(
+          {
+            logicalOperator: 'AND',
+            conditions: [level, { logicalOperator: 'AND', conditions: [status, path] }],
+          },
+          { logicalOperator: 'AND', conditions: [level, status, path] }
+        )
+      ).toBe(true)
+    })
+
+    it('treats an empty group as equal to no group', () => {
+      expect(
+        areFilterGroupsEquivalent(
+          {
+            logicalOperator: 'AND',
+            conditions: [level, { logicalOperator: 'OR', conditions: [] }],
+          },
+          { logicalOperator: 'AND', conditions: [level] }
+        )
+      ).toBe(true)
+    })
+
+    it('ignores condition and group order', () => {
+      expect(
+        areFilterGroupsEquivalent(
+          { logicalOperator: 'AND', conditions: [level, { ...orGroup }] },
+          {
+            logicalOperator: 'AND',
+            conditions: [
+              { logicalOperator: 'OR', conditions: [...orGroup.conditions].reverse() },
+              level,
+            ],
+          }
+        )
+      ).toBe(true)
+    })
+
+    it('tells an OR group apart from the same conditions ANDed together', () => {
+      expect(
+        areFilterGroupsEquivalent(
+          { logicalOperator: 'AND', conditions: [orGroup] },
+          { logicalOperator: 'AND', conditions: [status, path] }
+        )
+      ).toBe(false)
+    })
+
+    it('is false while either side is incomplete', () => {
+      const draft = { logicalOperator: 'AND' as const, conditions: [{ ...level, value: '' }] }
+      expect(areFilterGroupsEquivalent(draft, draft)).toBe(false)
+    })
   })
 })

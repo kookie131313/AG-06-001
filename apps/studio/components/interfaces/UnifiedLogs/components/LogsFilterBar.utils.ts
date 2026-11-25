@@ -1,4 +1,5 @@
 import {
+  isGroup,
   type AsyncOptionsFunction,
   type CustomOptionObject,
   type FilterCondition,
@@ -7,16 +8,31 @@ import {
 } from 'ui-patterns/FilterBar'
 import { z } from 'zod'
 
+import { DEFAULT_LOG_TYPES, LOG_TYPE_TO_SOURCE } from '../UnifiedLogs.constants'
 import {
+  getLogAttributeKey,
+  groupLogsFiltersByColumn,
   isLogsFilterColumnValue,
+  isLogsFilterGroupColumnFilterId,
+  isLogsFilterGroupValue,
+  isLogsFilterOperator,
+  parseLogsFilterUrlParams,
+  TOP_LEVEL_ONLY_FILTER_COLUMNS,
   type LogsColumnFilterValue,
+  type LogsFilter,
+  type LogsFilterGroupValue,
   type LogsFilterOperator,
 } from '../UnifiedLogs.filters'
+import type { QuerySearchParamsType } from '../UnifiedLogs.types'
 import { REPORTS_DATEPICKER_HELPERS } from '@/components/interfaces/Reports/Reports.constants'
 import {
   findMatchingDateHelper,
   formatDateRange,
 } from '@/components/interfaces/Settings/Logs/Logs.datePickerHelpers'
+import {
+  parseTimeRange,
+  serializeTimeRange,
+} from '@/components/interfaces/Settings/Logs/Logs.timeRange'
 import type { Option } from '@/components/ui/DataTable/DataTable.types'
 
 export const USER_PROPERTY = 'user'
@@ -50,6 +66,14 @@ const COMPARISON_OPERATORS: FilterProperty['operators'] = [
   { label: 'Not equal', value: '<>', group: 'comparison' },
 ]
 
+export const buildAttributeFilterProperty = (id: string): FilterProperty => ({
+  label: getLogAttributeKey(id) ?? id,
+  propertyGroupLabel: 'Attributes',
+  name: id,
+  type: 'string',
+  operators: COMPARISON_OPERATORS,
+})
+
 const PATTERN_OPERATORS: FilterProperty['operators'] = [
   { label: 'iLike', value: '~~*', group: 'pattern' },
   { label: 'Not iLike', value: '!~~*', group: 'pattern' },
@@ -74,6 +98,7 @@ export const buildFilterProperties = ({
           options: timeRangeOptions,
           formatValue: formatTimeRangeValue,
           operators: [{ label: 'Equals', value: '=', group: 'comparison' }],
+          topLevelOnly: true,
         }
       }
       // event_message only supports substring matching (it's free text); pathname
@@ -90,6 +115,7 @@ export const buildFilterProperties = ({
         type: 'string',
         options: field.options ?? [],
         operators,
+        topLevelOnly: TOP_LEVEL_ONLY_FILTER_COLUMNS.includes(field.value),
       }
     }),
     {
@@ -98,6 +124,7 @@ export const buildFilterProperties = ({
       type: 'string',
       options: userOptions ?? [],
       operators: [{ label: 'Equals', value: '=', group: 'comparison' }],
+      topLevelOnly: true,
     },
   ]
 }
@@ -129,16 +156,6 @@ export const buildColumnFilterValues = (
   return wrappedByColumn
 }
 
-export const serializeTimeRange = (range: Date[]): string =>
-  range.map((date) => date.toISOString()).join(' – ')
-
-export const parseTimeRange = (value: unknown): [Date, Date] | undefined => {
-  if (typeof value !== 'string') return
-  const result = z.tuple([z.coerce.date(), z.coerce.date()]).safeParse(value.split(' – '))
-  if (!result.success || result.data[0] > result.data[1]) return
-  return result.data
-}
-
 export const buildFilterGroup = (
   columnFilters: { id: string; value: unknown }[],
   filterableNames: Set<string>
@@ -158,7 +175,108 @@ export const buildFilterGroup = (
       conditions.push({ propertyName: id, value: String(v), operator: value.operator })
     }
   }
-  return { logicalOperator: 'AND', conditions }
+  const groups: FilterGroup[] = columnFilters.flatMap(({ id, value }) =>
+    isLogsFilterGroupColumnFilterId(id) && isLogsFilterGroupValue(value)
+      ? [
+          {
+            logicalOperator: 'OR' as const,
+            conditions: value.filters.map(({ column, operator, value }): FilterCondition => ({
+              propertyName: column,
+              operator,
+              value,
+            })),
+          },
+        ]
+      : []
+  )
+  return { logicalOperator: 'AND', conditions: [...conditions, ...groups] }
+}
+
+export const collectFilterConditions = (group: FilterGroup): FilterCondition[] =>
+  group.conditions.flatMap((condition) =>
+    isGroup(condition) ? collectFilterConditions(condition) : [condition]
+  )
+
+export interface NormalizedFilterGroup {
+  conditions: FilterCondition[]
+  groups: LogsFilterGroupValue[]
+}
+
+const toLogsFilter = (condition: FilterCondition): LogsFilter | undefined => {
+  const operator = String(condition.operator)
+  if (!isLogsFilterOperator(operator)) return undefined
+  if (!condition.propertyName || condition.value === null || condition.value === '')
+    return undefined
+  if (TOP_LEVEL_ONLY_FILTER_COLUMNS.includes(condition.propertyName)) return undefined
+  return { column: condition.propertyName, operator, value: String(condition.value) }
+}
+
+/**
+ * Reduces the filter bar tree to what Unified Logs can express: top-level conditions ANDed
+ * together plus any number of OR groups. Nested AND groups merge into the root and nested OR
+ * groups inside an OR group merge into it. Empty groups are skipped. Returns null while anything
+ * is incomplete (missing value) or can't be expressed (an AND group inside an OR group), so the caller
+ * leaves the applied filters untouched. The same goes for a column used with different
+ * operators at the root.
+ */
+export const normalizeFilterGroup = (root: FilterGroup): NormalizedFilterGroup | null => {
+  if (root.logicalOperator !== 'AND') return null
+
+  const conditions: FilterCondition[] = []
+  const groups: LogsFilterGroupValue[] = []
+
+  const collectOrFilters = (group: FilterGroup): LogsFilter[] | null => {
+    if (group.logicalOperator !== 'OR') return null
+    const filters: LogsFilter[] = []
+    for (const child of group.conditions) {
+      if (isGroup(child)) {
+        const nested = collectOrFilters(child)
+        if (!nested) return null
+        filters.push(...nested)
+        continue
+      }
+      const filter = toLogsFilter(child)
+      if (!filter) return null
+      filters.push(filter)
+    }
+    return filters
+  }
+
+  const collectRoot = (group: FilterGroup): boolean => {
+    for (const child of group.conditions) {
+      if (!isGroup(child)) {
+        if (!child.propertyName || !child.operator || child.value === null || child.value === '') {
+          return false
+        }
+        conditions.push(child)
+        continue
+      }
+      if (child.logicalOperator === 'AND') {
+        if (!collectRoot(child)) return false
+        continue
+      }
+      const filters = collectOrFilters(child)
+      if (!filters) return false
+      // An empty group constrains nothing, so a group emptied by removing its last condition
+      // stops filtering instead of leaving the old group applied.
+      if (filters.length === 0) continue
+      groups.push({ group: 'or', filters })
+    }
+    return true
+  }
+
+  if (!collectRoot(root)) return null
+
+  // The column-filter shape holds one operator per column, so `status <> 200 AND status = 500`
+  // can't be stored without one operator silently replacing the other.
+  const operatorByColumn = new Map<string, FilterCondition['operator']>()
+  for (const { propertyName, operator } of conditions) {
+    const existing = operatorByColumn.get(propertyName)
+    if (existing !== undefined && existing !== operator) return null
+    operatorByColumn.set(propertyName, operator)
+  }
+
+  return { conditions, groups }
 }
 
 export const formatTimeRangeValue = (value: FilterCondition['value']): string => {
@@ -167,4 +285,55 @@ export const formatTimeRangeValue = (value: FilterCondition['value']): string =>
   const [from, to] = range
   const helper = findMatchingDateHelper(from, to, REPORTS_DATEPICKER_HELPERS)
   return helper?.text ?? formatDateRange(from.toISOString(), to.toISOString())
+}
+
+export const getLogAttributeSources = (search: QuerySearchParamsType): string[] => {
+  const filter = groupLogsFiltersByColumn(parseLogsFilterUrlParams(search.filter)).log_type
+  const hasUser = !!search.user?.trim()
+  const hasDefaultSources = !filter && !search.scope && !hasUser
+  let types = Object.keys(LOG_TYPE_TO_SOURCE)
+  if (hasDefaultSources) types = [...DEFAULT_LOG_TYPES]
+  if (filter?.operator === '=') types = types.filter((type) => filter.values.includes(type))
+  if (filter?.operator === '<>') {
+    types = types.filter(
+      (type) =>
+        !filter.values.includes(type) && (!!search.scope || type !== 'edge function runtime')
+    )
+  }
+  const scopeTypes = search.scope?.filters.filter(({ column }) => column === 'log_type') ?? []
+  const includedScopeTypes = scopeTypes.filter(({ operator }) => operator === '=')
+  const excludedScopeTypes = scopeTypes.filter(({ operator }) => operator === '<>')
+  if (includedScopeTypes.length > 0) {
+    types = types.filter((type) => includedScopeTypes.some(({ value }) => value === type))
+  }
+  types = types.filter((type) => !excludedScopeTypes.some(({ value }) => value === type))
+  if (hasUser) types = types.filter((type) => type === 'edge' || type === 'auth')
+  return Object.entries(LOG_TYPE_TO_SOURCE)
+    .filter(([type]) => types.includes(type))
+    .map(([, source]) => source)
+}
+
+const conditionKey = ({ propertyName, operator, value }: FilterCondition) =>
+  JSON.stringify([propertyName, operator, String(value)])
+
+const filterKey = ({ column, operator, value }: LogsFilter) =>
+  JSON.stringify([column, operator, value])
+
+const getFilterSignature = (group: FilterGroup): string | null => {
+  const normalized = normalizeFilterGroup(group)
+  if (!normalized) return null
+  return JSON.stringify({
+    conditions: normalized.conditions.map(conditionKey).sort(),
+    groups: normalized.groups.map(({ filters }) => filters.map(filterKey).sort().join()).sort(),
+  })
+}
+
+/**
+ * Whether two filter bar trees apply the same filters once reduced to what Unified Logs can
+ * express. Lets the bar keep a nested AND group the user is editing (which merges into the
+ * root when applied) instead of rebuilding it from the applied filters.
+ */
+export const areFilterGroupsEquivalent = (a: FilterGroup, b: FilterGroup): boolean => {
+  const signature = getFilterSignature(a)
+  return signature !== null && signature === getFilterSignature(b)
 }

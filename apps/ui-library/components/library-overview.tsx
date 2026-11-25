@@ -3,6 +3,7 @@
 import { ArrowUpRight, Box } from 'lucide-react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
+import { Suspense, useLayoutEffect, useState } from 'react'
 import { Button, cn } from 'ui'
 
 import { CatalogPreview } from '@/components/catalog-preview'
@@ -12,7 +13,7 @@ import {
   libraryCategories,
   type LibraryBlock,
 } from '@/config/library'
-import { useFramework } from '@/context/framework-context'
+import { useFrameworkPreference } from '@/context/framework-preference-context'
 
 function LibraryCard({ block, framework }: { block: LibraryBlock; framework: string }) {
   return (
@@ -45,13 +46,18 @@ function LibraryCard({ block, framework }: { block: LibraryBlock; framework: str
   )
 }
 
+function CategoryFromUrl({ onChange }: { onChange: (category: string | null) => void }) {
+  const category = useSearchParams().get('category')
+  useLayoutEffect(() => onChange(category), [category, onChange])
+  return null
+}
+
 export function LibraryOverview() {
   const router = useRouter()
-  const searchParams = useSearchParams()
-  const selectedCategory = searchParams.get('category')
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
   const activeCategory =
     libraryCategories.find((category) => category.name === selectedCategory)?.name ?? 'All'
-  const { framework } = useFramework()
+  const { framework } = useFrameworkPreference()
 
   const filtered = libraryBlocks.filter(
     (block) => activeCategory === 'All' || block.category === activeCategory
@@ -64,7 +70,7 @@ export function LibraryOverview() {
     .filter((section) => section.items.length > 0)
 
   function selectCategory(category: string) {
-    const params = new URLSearchParams(searchParams.toString())
+    const params = new URLSearchParams(window.location.search)
     if (category === 'All') params.delete('category')
     else params.set('category', category)
     router.replace(params.size ? `/?${params}` : '/', { scroll: false })
@@ -72,6 +78,9 @@ export function LibraryOverview() {
 
   return (
     <main>
+      <Suspense fallback={null}>
+        <CategoryFromUrl onChange={setSelectedCategory} />
+      </Suspense>
       <section className="mx-auto flex max-w-7xl flex-col gap-6 px-4 pb-10 pt-16 md:px-8 md:pb-12 md:pt-24">
         <h1 className="max-w-2xl text-balance font-heading text-4xl font-medium tracking-normal sm:text-5xl sm:leading-none">
           Building blocks for your next backend.
